@@ -5,8 +5,10 @@ from prometheus_client import REGISTRY
 
 import litellm
 from litellm.integrations.prometheus import PrometheusLogger
-from litellm.integrations import prometheus_helpers
-from litellm.integrations.prometheus_helpers import BoundedPrometheusSeriesTracker
+from litellm.integrations.prometheus_helpers import bounded_prometheus_series_tracker
+from litellm.integrations.prometheus_helpers.bounded_prometheus_series_tracker import (
+    BoundedPrometheusSeriesTracker,
+)
 from litellm.types.integrations.prometheus import UserAPIKeyLabelValues
 
 
@@ -117,7 +119,11 @@ def test_prometheus_end_user_series_expire_by_ttl(monkeypatch):
     logger = PrometheusLogger()
 
     current_time = [monotonic()]
-    monkeypatch.setattr(prometheus_helpers.time, "monotonic", lambda: current_time[0])
+    monkeypatch.setattr(
+        bounded_prometheus_series_tracker.time,
+        "monotonic",
+        lambda: current_time[0],
+    )
     PrometheusLogger._inc_labeled_counter(
         logger,
         logger.litellm_spend_metric,
