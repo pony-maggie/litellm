@@ -6,7 +6,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
+from threading import RLock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -81,6 +84,10 @@ class PrometheusLogger(CustomLogger):
                 if _custom_buckets is not None
                 else LATENCY_BUCKETS
             )
+            self._end_user_metric_series: Dict[
+                str, OrderedDict[Tuple[Optional[str], ...], float]
+            ] = {}
+            self._end_user_metric_series_lock = RLock()
 
             # Create metric factory functions
             self._counter_factory = self._create_metric_factory(Counter)
@@ -984,6 +991,86 @@ class PrometheusLogger(CustomLogger):
 
         return filtered_labels
 
+    def _get_labeled_metric(
+        self,
+        metric: Any,
+        metric_name: DEFINED_PROMETHEUS_METRICS,
+        labels: Dict[str, Optional[str]],
+    ) -> Any:
+        labeled_metric = metric.labels(**labels)
+        self._track_end_user_metric_series(metric, metric_name, labels)
+        return labeled_metric
+
+    def _track_end_user_metric_series(
+        self,
+        metric: Any,
+        metric_name: DEFINED_PROMETHEUS_METRICS,
+        labels: Dict[str, Optional[str]],
+    ) -> None:
+        labelnames = self.get_labels_for_metric(metric_name)
+        if UserAPIKeyLabelNames.END_USER.value not in labelnames:
+            return
+
+        end_user = labels.get(UserAPIKeyLabelNames.END_USER.value)
+        if end_user is None:
+            return
+
+        max_series = getattr(
+            litellm, "prometheus_end_user_metrics_max_series_per_metric", 10000
+        )
+        ttl_seconds = getattr(
+            litellm, "prometheus_end_user_metrics_ttl_seconds", 3600.0
+        )
+        if max_series is None and ttl_seconds is None:
+            return
+
+        label_values = tuple(labels.get(label) for label in labelnames)
+        now = time.monotonic()
+
+        with self._end_user_metric_series_lock:
+            series = self._end_user_metric_series.setdefault(metric_name, OrderedDict())
+            series[label_values] = now
+            series.move_to_end(label_values)
+
+            if ttl_seconds is not None:
+                expired_label_values = [
+                    tracked_label_values
+                    for tracked_label_values, last_seen in series.items()
+                    if now - last_seen > ttl_seconds
+                ]
+                for tracked_label_values in expired_label_values:
+                    self._remove_prometheus_metric_series(
+                        metric, series, tracked_label_values
+                    )
+
+            if max_series is not None and max_series > 0:
+                while len(series) > max_series:
+                    tracked_label_values, _ = series.popitem(last=False)
+                    self._remove_prometheus_metric_child(metric, tracked_label_values)
+            elif max_series is not None:
+                while series:
+                    tracked_label_values, _ = series.popitem(last=False)
+                    self._remove_prometheus_metric_child(metric, tracked_label_values)
+
+    def _remove_prometheus_metric_series(
+        self,
+        metric: Any,
+        series: OrderedDict[Tuple[Optional[str], ...], float],
+        label_values: Tuple[Optional[str], ...],
+    ) -> None:
+        if label_values in series:
+            del series[label_values]
+        self._remove_prometheus_metric_child(metric, label_values)
+
+    @staticmethod
+    def _remove_prometheus_metric_child(
+        metric: Any, label_values: Tuple[Optional[str], ...]
+    ) -> None:
+        try:
+            metric.remove(*label_values)
+        except (AttributeError, KeyError, ValueError):
+            pass
+
     def _inc_labeled_counter(
         self,
         counter: Any,
@@ -997,7 +1084,7 @@ class PrometheusLogger(CustomLogger):
             enum_values=enum_values,
             label_context=label_context,
         )
-        counter.labels(**_labels).inc(amount)
+        self._get_labeled_metric(counter, metric_name, _labels).inc(amount)
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         # Define prometheus client
@@ -1468,8 +1555,10 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-            self.litellm_llm_api_time_to_first_token_metric.labels(
-                **_ttft_labels
+            self._get_labeled_metric(
+                self.litellm_llm_api_time_to_first_token_metric,
+                "litellm_llm_api_time_to_first_token_metric",
+                _ttft_labels,
             ).observe(time_to_first_token_seconds)
         else:
             verbose_logger.debug(
@@ -1488,9 +1577,11 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-            self.litellm_llm_api_latency_metric.labels(**_labels).observe(
-                api_call_total_time_seconds
-            )
+            self._get_labeled_metric(
+                self.litellm_llm_api_latency_metric,
+                "litellm_llm_api_latency_metric",
+                _labels,
+            ).observe(api_call_total_time_seconds)
 
         # total request latency
         total_time_seconds = self._safe_duration_seconds(
@@ -1505,9 +1596,11 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-            self.litellm_request_total_latency_metric.labels(**_labels).observe(
-                total_time_seconds
-            )
+            self._get_labeled_metric(
+                self.litellm_request_total_latency_metric,
+                "litellm_request_total_latency_metric",
+                _labels,
+            ).observe(total_time_seconds)
 
         # request queue time (time from arrival to processing start)
         _litellm_params = kwargs.get("litellm_params", {}) or {}
@@ -1522,9 +1615,11 @@ class PrometheusLogger(CustomLogger):
                 enum_values=enum_values,
                 label_context=label_context,
             )
-            self.litellm_request_queue_time_metric.labels(**_labels).observe(
-                queue_time_seconds
-            )
+            self._get_labeled_metric(
+                self.litellm_request_queue_time_metric,
+                "litellm_request_queue_time_seconds",
+                _labels,
+            ).observe(queue_time_seconds)
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         verbose_logger.debug(
@@ -1561,17 +1656,35 @@ class PrometheusLogger(CustomLogger):
         )
 
         try:
-            self.litellm_llm_api_failed_requests_metric.labels(
-                _sanitize_prometheus_label_value(end_user_id),
-                _sanitize_prometheus_label_value(user_api_key),
-                _sanitize_prometheus_label_value(user_api_key_alias),
-                _sanitize_prometheus_label_value(model),
-                _sanitize_prometheus_label_value(user_api_team),
-                _sanitize_prometheus_label_value(user_api_team_alias),
-                _sanitize_prometheus_label_value(user_id),
-                _sanitize_prometheus_label_value(
-                    standard_logging_payload.get("model_id", "")
-                ),
+            self._get_labeled_metric(
+                self.litellm_llm_api_failed_requests_metric,
+                "litellm_llm_api_failed_requests_metric",
+                {
+                    UserAPIKeyLabelNames.END_USER.value: _sanitize_prometheus_label_value(
+                        end_user_id
+                    ),
+                    UserAPIKeyLabelNames.API_KEY_HASH.value: _sanitize_prometheus_label_value(
+                        user_api_key
+                    ),
+                    UserAPIKeyLabelNames.API_KEY_ALIAS.value: _sanitize_prometheus_label_value(
+                        user_api_key_alias
+                    ),
+                    UserAPIKeyLabelNames.v1_LITELLM_MODEL_NAME.value: _sanitize_prometheus_label_value(
+                        model
+                    ),
+                    UserAPIKeyLabelNames.TEAM.value: _sanitize_prometheus_label_value(
+                        user_api_team
+                    ),
+                    UserAPIKeyLabelNames.TEAM_ALIAS.value: _sanitize_prometheus_label_value(
+                        user_api_team_alias
+                    ),
+                    UserAPIKeyLabelNames.USER.value: _sanitize_prometheus_label_value(
+                        user_id
+                    ),
+                    UserAPIKeyLabelNames.MODEL_ID.value: _sanitize_prometheus_label_value(
+                        standard_logging_payload.get("model_id", "")
+                    ),
+                },
             ).inc()
             self.set_llm_deployment_failure_metrics(kwargs)
             await self._set_org_budget_metrics_after_api_request(
