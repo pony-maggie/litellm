@@ -1621,36 +1621,40 @@ class PrometheusLogger(CustomLogger):
         )
 
         try:
-            self._get_labeled_metric(
-                self.litellm_llm_api_failed_requests_metric,
-                "litellm_llm_api_failed_requests_metric",
-                {
-                    UserAPIKeyLabelNames.END_USER.value: _sanitize_prometheus_label_value(
-                        end_user_id
-                    ),
-                    UserAPIKeyLabelNames.API_KEY_HASH.value: _sanitize_prometheus_label_value(
-                        user_api_key
-                    ),
-                    UserAPIKeyLabelNames.API_KEY_ALIAS.value: _sanitize_prometheus_label_value(
-                        user_api_key_alias
-                    ),
-                    UserAPIKeyLabelNames.v1_LITELLM_MODEL_NAME.value: _sanitize_prometheus_label_value(
-                        model
-                    ),
-                    UserAPIKeyLabelNames.TEAM.value: _sanitize_prometheus_label_value(
-                        user_api_team
-                    ),
-                    UserAPIKeyLabelNames.TEAM_ALIAS.value: _sanitize_prometheus_label_value(
-                        user_api_team_alias
-                    ),
-                    UserAPIKeyLabelNames.USER.value: _sanitize_prometheus_label_value(
-                        user_id
-                    ),
-                    UserAPIKeyLabelNames.MODEL_ID.value: _sanitize_prometheus_label_value(
-                        standard_logging_payload.get("model_id", "")
-                    ),
-                },
+            _failed_request_label_values = (
+                _sanitize_prometheus_label_value(end_user_id),
+                _sanitize_prometheus_label_value(user_api_key),
+                _sanitize_prometheus_label_value(user_api_key_alias),
+                _sanitize_prometheus_label_value(model),
+                _sanitize_prometheus_label_value(user_api_team),
+                _sanitize_prometheus_label_value(user_api_team_alias),
+                _sanitize_prometheus_label_value(user_id),
+                _sanitize_prometheus_label_value(
+                    standard_logging_payload.get("model_id", "")
+                ),
+            )
+            self.litellm_llm_api_failed_requests_metric.labels(
+                *_failed_request_label_values
             ).inc()
+            if end_user_id is not None:
+                self._bounded_prometheus_series_tracker.track_series(
+                    metric=self.litellm_llm_api_failed_requests_metric,
+                    metric_name="litellm_llm_api_failed_requests_metric",
+                    label_values=_failed_request_label_values,
+                    max_series=getattr(
+                        litellm,
+                        "prometheus_end_user_metrics_max_series_per_metric",
+                        10000,
+                    ),
+                    ttl_seconds=getattr(
+                        litellm, "prometheus_end_user_metrics_ttl_seconds", 3600.0
+                    ),
+                    cleanup_interval_seconds=getattr(
+                        litellm,
+                        "prometheus_end_user_metrics_cleanup_interval_seconds",
+                        60.0,
+                    ),
+                )
             self.set_llm_deployment_failure_metrics(kwargs)
             await self._set_org_budget_metrics_after_api_request(
                 org_id=user_api_key_org_id,
