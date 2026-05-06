@@ -17,7 +17,7 @@ class BoundedPrometheusSeriesTracker:
     def __init__(self) -> None:
         self._series: Dict[str, OrderedDict[tuple[Optional[str], ...], float]] = {}
         self._last_ttl_cleanup: Dict[str, float] = {}
-        self._lock = RLock()
+        self.lock = RLock()
 
     def track_series(
         self,
@@ -33,7 +33,7 @@ class BoundedPrometheusSeriesTracker:
 
         now = time.monotonic()
 
-        with self._lock:
+        with self.lock:
             series = self._series.setdefault(metric_name, OrderedDict())
             series[label_values] = now
             series.move_to_end(label_values)
@@ -53,12 +53,16 @@ class BoundedPrometheusSeriesTracker:
 
             if max_series is not None and max_series > 0:
                 while len(series) > max_series:
-                    tracked_label_values, _ = series.popitem(last=False)
-                    self._remove_metric_child(metric, tracked_label_values)
+                    tracked_label_values = next(iter(series))
+                    if not self._remove_metric_child(metric, tracked_label_values):
+                        break
+                    del series[tracked_label_values]
             elif max_series is not None:
                 while series:
-                    tracked_label_values, _ = series.popitem(last=False)
-                    self._remove_metric_child(metric, tracked_label_values)
+                    tracked_label_values = next(iter(series))
+                    if not self._remove_metric_child(metric, tracked_label_values):
+                        break
+                    del series[tracked_label_values]
 
     def _should_run_ttl_cleanup(
         self,
@@ -82,15 +86,26 @@ class BoundedPrometheusSeriesTracker:
         series: OrderedDict[tuple[Optional[str], ...], float],
         label_values: tuple[Optional[str], ...],
     ) -> None:
-        if label_values in series:
-            del series[label_values]
-        self._remove_metric_child(metric, label_values)
+        if self._remove_metric_child(metric, label_values):
+            series.pop(label_values, None)
 
     @staticmethod
     def _remove_metric_child(
         metric: Any, label_values: tuple[Optional[str], ...]
-    ) -> None:
+    ) -> bool:
+        """
+        Remove the Prometheus child for ``label_values`` and report whether the
+        tracker should commit the matching state change.
+
+        Returns ``True`` when the child is no longer present in Prometheus
+        (either it was just removed or it was already gone), and ``False`` when
+        ``metric.remove()`` raised an unexpected error and the child likely
+        still exists.
+        """
         try:
             metric.remove(*label_values)
-        except (AttributeError, KeyError, ValueError):
-            pass
+            return True
+        except KeyError:
+            return True
+        except (AttributeError, ValueError):
+            return False

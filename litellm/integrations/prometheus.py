@@ -994,9 +994,10 @@ class PrometheusLogger(CustomLogger):
         metric_name: DEFINED_PROMETHEUS_METRICS,
         labels: Dict[str, Optional[str]],
     ) -> Any:
-        labeled_metric = metric.labels(**labels)
-        self._track_bounded_prometheus_metric_series(metric, metric_name, labels)
-        return labeled_metric
+        with self._bounded_prometheus_series_tracker.lock:
+            labeled_metric = metric.labels(**labels)
+            self._track_bounded_prometheus_metric_series(metric, metric_name, labels)
+            return labeled_metric
 
     def _track_bounded_prometheus_metric_series(
         self,
