@@ -6,10 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
-from collections import OrderedDict
 from datetime import datetime, timedelta
-from threading import RLock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,6 +26,7 @@ import litellm
 from litellm._logging import print_verbose, verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.prometheus_helpers import (
+    BoundedPrometheusSeriesTracker,
     PrometheusLabelFactoryContext,
     _get_cached_end_user_id_for_cost_tracking,
 )
@@ -84,11 +82,7 @@ class PrometheusLogger(CustomLogger):
                 if _custom_buckets is not None
                 else LATENCY_BUCKETS
             )
-            self._end_user_metric_series: Dict[
-                str, OrderedDict[Tuple[Optional[str], ...], float]
-            ] = {}
-            self._end_user_metric_last_ttl_cleanup: Dict[str, float] = {}
-            self._end_user_metric_series_lock = RLock()
+            self._bounded_prometheus_series_tracker = BoundedPrometheusSeriesTracker()
 
             # Create metric factory functions
             self._counter_factory = self._create_metric_factory(Counter)
@@ -999,10 +993,10 @@ class PrometheusLogger(CustomLogger):
         labels: Dict[str, Optional[str]],
     ) -> Any:
         labeled_metric = metric.labels(**labels)
-        self._track_end_user_metric_series(metric, metric_name, labels)
+        self._track_bounded_prometheus_metric_series(metric, metric_name, labels)
         return labeled_metric
 
-    def _track_end_user_metric_series(
+    def _track_bounded_prometheus_metric_series(
         self,
         metric: Any,
         metric_name: DEFINED_PROMETHEUS_METRICS,
@@ -1031,71 +1025,14 @@ class PrometheusLogger(CustomLogger):
             return
 
         label_values = tuple(labels.get(label) for label in labelnames)
-        now = time.monotonic()
-
-        with self._end_user_metric_series_lock:
-            series = self._end_user_metric_series.setdefault(metric_name, OrderedDict())
-            series[label_values] = now
-            series.move_to_end(label_values)
-
-            if ttl_seconds is not None and self._should_run_end_user_ttl_cleanup(
-                metric_name=metric_name,
-                now=now,
-                ttl_cleanup_interval_seconds=ttl_cleanup_interval_seconds,
-            ):
-                expired_label_values = [
-                    tracked_label_values
-                    for tracked_label_values, last_seen in series.items()
-                    if now - last_seen > ttl_seconds
-                ]
-                for tracked_label_values in expired_label_values:
-                    self._remove_prometheus_metric_series(
-                        metric, series, tracked_label_values
-                    )
-
-            if max_series is not None and max_series > 0:
-                while len(series) > max_series:
-                    tracked_label_values, _ = series.popitem(last=False)
-                    self._remove_prometheus_metric_child(metric, tracked_label_values)
-            elif max_series is not None:
-                while series:
-                    tracked_label_values, _ = series.popitem(last=False)
-                    self._remove_prometheus_metric_child(metric, tracked_label_values)
-
-    def _should_run_end_user_ttl_cleanup(
-        self,
-        metric_name: DEFINED_PROMETHEUS_METRICS,
-        now: float,
-        ttl_cleanup_interval_seconds: Optional[float],
-    ) -> bool:
-        if ttl_cleanup_interval_seconds is None or ttl_cleanup_interval_seconds <= 0:
-            self._end_user_metric_last_ttl_cleanup[metric_name] = now
-            return True
-
-        last_cleanup = self._end_user_metric_last_ttl_cleanup.get(metric_name)
-        if last_cleanup is None or now - last_cleanup >= ttl_cleanup_interval_seconds:
-            self._end_user_metric_last_ttl_cleanup[metric_name] = now
-            return True
-        return False
-
-    def _remove_prometheus_metric_series(
-        self,
-        metric: Any,
-        series: OrderedDict[Tuple[Optional[str], ...], float],
-        label_values: Tuple[Optional[str], ...],
-    ) -> None:
-        if label_values in series:
-            del series[label_values]
-        self._remove_prometheus_metric_child(metric, label_values)
-
-    @staticmethod
-    def _remove_prometheus_metric_child(
-        metric: Any, label_values: Tuple[Optional[str], ...]
-    ) -> None:
-        try:
-            metric.remove(*label_values)
-        except (AttributeError, KeyError, ValueError):
-            pass
+        self._bounded_prometheus_series_tracker.track_series(
+            metric=metric,
+            metric_name=metric_name,
+            label_values=label_values,
+            max_series=max_series,
+            ttl_seconds=ttl_seconds,
+            cleanup_interval_seconds=ttl_cleanup_interval_seconds,
+        )
 
     def _inc_labeled_counter(
         self,

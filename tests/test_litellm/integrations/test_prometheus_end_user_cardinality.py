@@ -5,6 +5,8 @@ from prometheus_client import REGISTRY
 
 import litellm
 from litellm.integrations.prometheus import PrometheusLogger
+from litellm.integrations import prometheus_helpers
+from litellm.integrations.prometheus_helpers import BoundedPrometheusSeriesTracker
 from litellm.types.integrations.prometheus import UserAPIKeyLabelValues
 
 
@@ -73,6 +75,33 @@ def test_prometheus_end_user_series_are_capped_per_metric():
     }
 
 
+def test_bounded_prometheus_series_tracker_is_label_agnostic():
+    class FakeMetric:
+        def __init__(self):
+            self.removed_label_values = []
+
+        def remove(self, *label_values):
+            self.removed_label_values.append(label_values)
+
+    metric = FakeMetric()
+    tracker = BoundedPrometheusSeriesTracker()
+
+    for index in range(4):
+        tracker.track_series(
+            metric=metric,
+            metric_name="generic_metric",
+            label_values=(f"route-{index}", "200"),
+            max_series=2,
+            ttl_seconds=None,
+            cleanup_interval_seconds=60.0,
+        )
+
+    assert metric.removed_label_values == [
+        ("route-0", "200"),
+        ("route-1", "200"),
+    ]
+
+
 def test_prometheus_end_user_series_expire_by_ttl(monkeypatch):
     litellm.enable_end_user_cost_tracking_prometheus_only = True
     litellm.prometheus_metrics_config = [
@@ -88,9 +117,7 @@ def test_prometheus_end_user_series_expire_by_ttl(monkeypatch):
     logger = PrometheusLogger()
 
     current_time = [monotonic()]
-    monkeypatch.setattr(
-        "litellm.integrations.prometheus.time.monotonic", lambda: current_time[0]
-    )
+    monkeypatch.setattr(prometheus_helpers.time, "monotonic", lambda: current_time[0])
     PrometheusLogger._inc_labeled_counter(
         logger,
         logger.litellm_spend_metric,
