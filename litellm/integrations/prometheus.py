@@ -87,6 +87,7 @@ class PrometheusLogger(CustomLogger):
             self._end_user_metric_series: Dict[
                 str, OrderedDict[Tuple[Optional[str], ...], float]
             ] = {}
+            self._end_user_metric_last_ttl_cleanup: Dict[str, float] = {}
             self._end_user_metric_series_lock = RLock()
 
             # Create metric factory functions
@@ -1021,6 +1022,11 @@ class PrometheusLogger(CustomLogger):
         ttl_seconds = getattr(
             litellm, "prometheus_end_user_metrics_ttl_seconds", 3600.0
         )
+        ttl_cleanup_interval_seconds = getattr(
+            litellm,
+            "prometheus_end_user_metrics_cleanup_interval_seconds",
+            60.0,
+        )
         if max_series is None and ttl_seconds is None:
             return
 
@@ -1032,7 +1038,11 @@ class PrometheusLogger(CustomLogger):
             series[label_values] = now
             series.move_to_end(label_values)
 
-            if ttl_seconds is not None:
+            if ttl_seconds is not None and self._should_run_end_user_ttl_cleanup(
+                metric_name=metric_name,
+                now=now,
+                ttl_cleanup_interval_seconds=ttl_cleanup_interval_seconds,
+            ):
                 expired_label_values = [
                     tracked_label_values
                     for tracked_label_values, last_seen in series.items()
@@ -1051,6 +1061,22 @@ class PrometheusLogger(CustomLogger):
                 while series:
                     tracked_label_values, _ = series.popitem(last=False)
                     self._remove_prometheus_metric_child(metric, tracked_label_values)
+
+    def _should_run_end_user_ttl_cleanup(
+        self,
+        metric_name: DEFINED_PROMETHEUS_METRICS,
+        now: float,
+        ttl_cleanup_interval_seconds: Optional[float],
+    ) -> bool:
+        if ttl_cleanup_interval_seconds is None or ttl_cleanup_interval_seconds <= 0:
+            self._end_user_metric_last_ttl_cleanup[metric_name] = now
+            return True
+
+        last_cleanup = self._end_user_metric_last_ttl_cleanup.get(metric_name)
+        if last_cleanup is None or now - last_cleanup >= ttl_cleanup_interval_seconds:
+            self._end_user_metric_last_ttl_cleanup[metric_name] = now
+            return True
+        return False
 
     def _remove_prometheus_metric_series(
         self,
